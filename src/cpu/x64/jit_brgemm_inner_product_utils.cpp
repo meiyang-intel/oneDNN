@@ -114,6 +114,9 @@ int get_os_block(const jit_brgemm_primitive_conf_t &jbgp, bool try_to_adjust,
     }
     if (os_block == 1) os_block = nstl::min(jbgp.os, max_os_block);
 
+    // Use large os-block to reduce bandwidth requirement.
+    if (jbgp.use_small_os_kernels) os_block = jbgp.os;
+
     return os_block;
 }
 
@@ -178,13 +181,22 @@ int get_oc_block(const jit_brgemm_primitive_conf_t &jbgp, bool try_to_adjust) {
         else
             return 16;
     } else {
+        int oc_block = 0;
         if (jbgp.oc >= 64) {
-            return 64;
+            oc_block = 64;
         } else if (jbgp.oc >= 32) {
-            return 32;
+            oc_block = 32;
         } else {
-            return 16;
+            oc_block = 16;
         }
+
+        // Use smaller oc-block avoiding bad leading dimensions to reduce
+        // bandwidth requirement for weights and increase parallelism, since no
+        // threading will be done in os-direction.
+        bool is_bad_ld = jbgp.ic % 1024 == 0;
+        if (jbgp.use_small_os_kernels && !is_bad_ld) oc_block = 32;
+
+        return oc_block;
     }
 }
 
@@ -225,7 +237,7 @@ int ip_fwd_get_adjusted_oc_block(const jit_brgemm_primitive_conf_t &jbgp) {
             = jbgp.isa == avx512_core_bf16_amx_bf16 && !jbgp.is_bf32;
 
     // we can't change block size on forward and weights update (external)
-    // if layout is set by user, for backward data it can be choosen different
+    // if layout is set by user, for backward data it can be chosen different
     // from external in this case because copy routine
     const bool not_adjustable_oc_block_size
             = !jbgp.is_wei_layout_any && jbgp.prop_kind != backward_data;
@@ -426,6 +438,7 @@ status_t init_ip_conf_fwd(jit_brgemm_primitive_conf_t &jbgp,
             }
         }
     }
+
     jbgp.use_buffer = (IMPLICATION(jbgp.dst_dt == jbgp.acc_dt, jbgp.with_sum))
             || (jbgp.nthr_ic_b > 1);
 
@@ -1038,6 +1051,12 @@ status_t init_ip_conf(cpu_isa_t isa, jit_brgemm_primitive_conf_t &jbgp,
 
     jbgp.brg_type = brgemm_addr;
     jbgp.nthr = nthreads;
+
+    // Use blocking and kernels that reduce bandwidth requirement for small os
+    // sizes.
+    // TODO: Evaluate for other precisions, testing only done for f32.
+    bool small_os = jbgp.os <= 80;
+    jbgp.use_small_os_kernels = is_f32 && small_os && jbgp.oc % 32 == 0;
 
     jbgp.use_uker = true;
     jbgp.use_interleave_stores = jbgp.use_uker;
