@@ -2019,6 +2019,10 @@ void jit_brgemm_trans_wei_f32_t::generate() {
         case OIw16i64o2i:
         case OIhw16i64o2i:
         case OIdhw16i64o2i: fwd_oc_block = 4 * conf_->simd_w; break;
+        case OI16i48o:
+        case OIw16i48o:
+        case OIhw16i48o:
+        case OIdhw16i48o: fwd_oc_block = 3 * conf_->simd_w; break;
         case OI16i32o:
         case OIw16i32o:
         case OIhw16i32o:

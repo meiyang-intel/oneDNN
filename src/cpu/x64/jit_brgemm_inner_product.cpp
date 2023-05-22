@@ -97,9 +97,6 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     const float *oscales = precompute_scales(ctx.get_scratchpad_grantor(),
             src_scales, wei_scales, pd()->OC(), pd()->attr());
 
-    const bool is_f32 = everyone_is(f32, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt);
-    const bool is_f32_compute = is_f32 && !jbgp.is_bf32;
-
     const size_t src_dt_size = types::data_type_size(jbgp.src_dt);
     const size_t bia_dt_size
             = jbgp.with_bias ? types::data_type_size(jbgp.bia_dt) : 0;
@@ -141,14 +138,18 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     bool is_oc_tail = (jbgp.oc < jbgp.oc_block);
     int base_brg_ker_idx = brgemm_inner_product_utils::
             get_brg_kernel_index( // TODO: Can be calculated on initialization stage
-                    jbgp, false, false, is_os_tail, is_oc_tail, false);
+                    false, false, is_os_tail, is_oc_tail, false);
     const dims_t ic_dims = {0, jbgp.ic_block, 0, 0, 0};
     const auto wei_ic_stride
             = types::data_type_size(jbgp.wei_dt) * weights_d.off_v(ic_dims);
 
-    const auto ker = [&](int ithr_oc_mb, int nthr_oc_mb, int ithr_ic, int n,
-                             int ocb, int icc, bool do_init, int buffer_a_osb,
+    const auto ker = [&](int ithr_oc_mb, int nthr_oc_mb, int ithr_ic, int osb,
+                             int osb_s, int ocb, int ocb_s, int icc, int icc_s,
                              bool copy_buffer_a, int &prev_ker_idx) {
+        const int cur_ocb = ocb + ocb_s;
+        const int cur_osb = osb + osb_s;
+        const int cur_icc = icc + icc_s;
+        const int n = cur_osb * jbgp.os_block;
         const int ithr = nthr_oc_mb * ithr_ic + ithr_oc_mb;
         auto addr_batch = addr_batch_global + ithr * jbgp.adjusted_batch_size;
 
@@ -156,12 +157,11 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                 = src_dt_size * jbgp.LDA * jbgp.os_block;
         const size_t a_buffer_per_thr
                 = a_buffer_osb_stride * jbgp.nb_os_blocking;
-        auto a_buffer = (jbgp.use_buffer_a)
-                ? a_buffer_global + ithr * a_buffer_per_thr
-                        + buffer_a_osb * a_buffer_osb_stride
-                : nullptr;
+        auto a_buffer = (jbgp.use_buffer_a) ? a_buffer_global
+                        + ithr * a_buffer_per_thr + osb * a_buffer_osb_stride
+                                            : nullptr;
 
-        const int oc = ocb * jbgp.oc_block;
+        const int oc = cur_ocb * jbgp.oc_block;
         const size_t dst_off = get_blk_off(dst_d, jbgp.dst_dt, n, oc);
 
         const bool use_c_buffer = (jbgp.with_sum)
@@ -169,31 +169,65 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         char *c_buffer = nullptr;
         if (use_c_buffer) {
-            const size_t c_buf_thr_idx = jbgp.nthr_ic_b <= 1
-                    ? ithr
-                    : (jbgp.acc_dt != jbgp.dst_dt || jbgp.with_sum
-                                    ? ithr_ic
-                                    : ithr_ic - 1);
-            const size_t c_buf_num_rows = jbgp.nthr_ic_b > 1 ? jbgp.mb : jbgp.M;
-            const size_t c_buffer_shift
-                    = c_buf_thr_idx * c_buf_num_rows * jbgp.LDC;
-            const size_t c_buffer_off = acc_dt_size * c_buffer_shift
-                    + (jbgp.nthr_ic_b > 1 ? acc_dt_size * dst_off / dst_dt_size
-                                          : 0);
-            c_buffer = c_buffer_global + c_buffer_off;
+            size_t c_buf_idx = 0;
+            size_t c_buf_nrows = 0;
+            size_t c_buf_walk = 0;
+
+            if (jbgp.nthr_ic_b > 1) {
+                c_buf_idx = ithr_ic - 1;
+                c_buf_idx += jbgp.acc_dt != jbgp.dst_dt || jbgp.with_sum;
+                c_buf_nrows = jbgp.mb;
+
+                // NOTE: This trick only works because the leading dimension of
+                // buffer and memory descriptor is same.
+                c_buf_walk = dst_off / dst_dt_size;
+            } else {
+                using loop_order_t = jit_brgemm_ip_fwd_conf_t::loop_order_t;
+                switch (jbgp.loop_order) {
+                    case loop_order_t::osc_occ_osb_ocb_icc:
+                        c_buf_idx = ithr;
+                        c_buf_nrows = jbgp.M;
+
+                        // Single small block buffer, no walk needed.
+                        c_buf_walk = 0;
+                        break;
+                    case loop_order_t::osc_occ_icc_osb_ocb:
+                        c_buf_idx = ithr;
+                        c_buf_nrows = jbgp.os_block * jbgp.nb_os_blocking;
+
+                        // Walk for each block in os/oc-chunk.
+                        c_buf_walk = osb * jbgp.os_block * jbgp.LDC
+                                + ocb * jbgp.oc_block;
+                        break;
+                    case loop_order_t::icc_osc_occ_osb_ocb:
+                    case loop_order_t::icc_occ_osc_ocb_osb:
+                        c_buf_idx = 0;
+                        c_buf_nrows = jbgp.os;
+
+                        // NOTE: This trick only works because the leading
+                        // dimension of buffer and memory descriptor is same.
+                        c_buf_walk = dst_off / dst_dt_size;
+                        break;
+                }
+            }
+
+            size_t c_buf_shift = c_buf_idx * c_buf_nrows * jbgp.LDC;
+            c_buf_shift += c_buf_walk;
+            size_t c_buf_off = acc_dt_size * c_buf_shift;
+            c_buffer = c_buffer_global + c_buf_off;
         }
 
         char *wsp_tile = is_amx
                 ? wsp_tile_base + ithr * jbgp.amx_buf_size_per_thread
                 : nullptr;
-        int icb = icc * jbgp.nb_ic_blocking;
+        int icb = cur_icc * jbgp.nb_ic_blocking;
         int ic = icb * jbgp.ic_block;
 
-        bool kernel_init = do_init;
+        bool kernel_init = cur_icc == icc_s;
 
         bool is_os_tail = (jbgp.mb - n < jbgp.os_block);
         bool is_oc_tail = (jbgp.oc - oc < jbgp.oc_block);
-        bool is_last_ic_chunk = icc == ic_chunks - 1;
+        bool is_last_ic_chunk = cur_icc == ic_chunks - 1;
         bool is_ic_tail = is_last_ic_chunk && jbgp.K_tail > 0;
         const int remaining_ic_blks
                 = (jbgp.use_buffer_a ? utils::rnd_up(jbgp.ic, jbgp.ic_block)
@@ -204,10 +238,11 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         auto is_bs_tail = (gemm_batch != jbgp.gemm_batch_size);
         int brg_ker_idx = brgemm_inner_product_utils::get_brg_kernel_index(
-                jbgp, is_bs_tail, kernel_init, is_os_tail, is_oc_tail, false);
+                is_bs_tail, kernel_init, is_os_tail, is_oc_tail, false);
         auto brg_kernel = brg_kernels_[brg_ker_idx].get();
         const int ic_blocks_per_batch = jbgp.K / jbgp.ic_block;
-        const dim_t wei_cur_ocb = get_blk_off(weights_d, jbgp.wei_dt, ocb, 0);
+        const dim_t wei_cur_ocb
+                = get_blk_off(weights_d, jbgp.wei_dt, cur_ocb, 0);
 
         if (copy_buffer_a) {
             assert(!jbgp.is_bf32);
@@ -282,7 +317,7 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
             assert(!jbgp.use_buffer_a);
             auto use_init_ker = (kernel_init && gemm_batch == 0);
             int brg_ker_ic_tail_idx
-                    = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                    = brgemm_inner_product_utils::get_brg_kernel_index(
                             false, use_init_ker, is_os_tail, is_oc_tail, true);
             maybe_tile_configure(is_amx, brg_kernel_palettes_,
                     brg_ker_ic_tail_idx, prev_ker_idx);
@@ -360,61 +395,7 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         const int icc_work = icc_end - icc_start;
 
-        enum loop_order {
-            osc_occ_icc_osb_ocb,
-            osc_occ_osb_ocb_icc,
-            icc_osc_occ_osb_ocb,
-            icc_occ_osc_ocb_osb,
-        };
-        enum loop_order order = osc_occ_osb_ocb_icc;
-
-        // icc-loop can only be interchanged if we don't need additional memory
-        // for accumulation.
-        const bool icc_loop_swapable = !jbgp.use_buffer;
-
-        // Optimize loop order for f32, if buffer is not required.
-        const bool ocb_inner_most = is_f32_compute && icc_loop_swapable;
-        if (ocb_inner_most) {
-            order = osc_occ_icc_osb_ocb;
-
-            // Use icc loop as outer-most to save bandwidth when os is small.
-            if (jbgp.use_small_os_kernels) order = icc_osc_occ_osb_ocb;
-        }
-
-        const int os_chunk_sz = jbgp.os_block * jbgp.nb_os_blocking;
-        const int oc_chunk_sz = jbgp.oc_block * jbgp.nb_oc_blocking;
-        const int ic_chunk_sz = jbgp.ic_block * jbgp.nb_ic_blocking;
-        const int n_blocks = div_up(work_amount, nthr_oc_mb);
-        const int n_ic_blocks = div_up(icc_work, nthr_ic);
-
-        int oc_span_osc_occ = nstl::min(n_blocks, oc_chunks) * oc_chunk_sz;
-        int os_span_osc_occ = div_up(n_blocks, oc_chunks) * os_chunk_sz;
-        oc_span_osc_occ = nstl::min(oc_span_osc_occ, jbgp.oc);
-        os_span_osc_occ = nstl::min(os_span_osc_occ, jbgp.os);
-
-        int os_span_occ_osc = nstl::min(n_blocks, os_chunks) * os_chunk_sz;
-        int oc_span_occ_osc = div_up(n_blocks, os_chunks) * oc_chunk_sz;
-        os_span_occ_osc = nstl::min(os_span_occ_osc, jbgp.os);
-        oc_span_occ_osc = nstl::min(oc_span_occ_osc, jbgp.oc);
-
-        int k_span = nstl::min(n_ic_blocks * ic_chunk_sz, jbgp.ic);
-
-        auto eff = [](dim_t m, dim_t n, dim_t k) {
-            return 2 * m * n * k / float(m * k + n * k + 2 * m * n);
-        };
-
-        // Prefer to use occ_osc_... instead of osc_occ_... if compute
-        // intensity increases more than a threshold.
-        float eff_osc_occ = eff(os_span_osc_occ, oc_span_osc_occ, k_span);
-        float eff_occ_osc = eff(os_span_occ_osc, oc_span_occ_osc, k_span);
-        bool do_occ_osc = eff_occ_osc > 1.2 * eff_osc_occ;
-
-        // Enable occ_osc_... for f32 and with small os-blocks.
-        // TODO: Expand to other precisions and other blocks sizes.
-        const bool is_avx512 = is_superset(isa, avx512_core);
-        if ((jbgp.os_block < 32 || do_occ_osc) && is_f32_compute
-                && icc_loop_swapable && is_avx512)
-            order = icc_occ_osc_ocb_osb;
+        const auto order = jbgp.loop_order;
 
         int prev_ker_idx = -1;
         maybe_tile_configure(
@@ -422,13 +403,15 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         int icc {0}, occ {0}, osc {0};
         int start {start_init};
+        using loop_order_t = jit_brgemm_ip_fwd_conf_t::loop_order_t;
+
         switch (order) {
-            case osc_occ_icc_osb_ocb:
-            case osc_occ_osb_ocb_icc:
-            case icc_osc_occ_osb_ocb:
+            case loop_order_t::osc_occ_icc_osb_ocb:
+            case loop_order_t::osc_occ_osb_ocb_icc:
+            case loop_order_t::icc_osc_occ_osb_ocb:
                 nd_iterator_init(start, osc, os_chunks, occ, oc_chunks);
                 break;
-            case icc_occ_osc_ocb_osb:
+            case loop_order_t::icc_occ_osc_ocb_osb:
                 nd_iterator_init(start, occ, oc_chunks, osc, os_chunks);
                 break;
         }
@@ -445,54 +428,57 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
             // Each thread runs the below loops:
             int loop_start = 0, loop_end = 0;
             switch (order) {
-                case osc_occ_icc_osb_ocb:
-                case osc_occ_osb_ocb_icc:
+                case loop_order_t::osc_occ_icc_osb_ocb:
+                case loop_order_t::osc_occ_osb_ocb_icc:
                     loop_end = icc_work * osb_work * ocb_work;
                     break;
-                case icc_occ_osc_ocb_osb:
-                case icc_osc_occ_osb_ocb: loop_end = osb_work * ocb_work; break;
+                case loop_order_t::icc_occ_osc_ocb_osb:
+                case loop_order_t::icc_osc_occ_osb_ocb:
+                    loop_end = osb_work * ocb_work;
+                    break;
             }
 
             int osb = 0, ocb = 0;
             switch (order) {
-                case osc_occ_icc_osb_ocb:
+                case loop_order_t::osc_occ_icc_osb_ocb:
                     nd_iterator_init(
                             0, icc, icc_work, osb, osb_work, ocb, ocb_work);
                     break;
-                case osc_occ_osb_ocb_icc:
+                case loop_order_t::osc_occ_osb_ocb_icc:
                     nd_iterator_init(
                             0, osb, osb_work, ocb, ocb_work, icc, icc_work);
                     break;
-                case icc_osc_occ_osb_ocb:
+                case loop_order_t::icc_osc_occ_osb_ocb:
                     nd_iterator_init(0, osb, osb_work, ocb, ocb_work);
                     break;
-                case icc_occ_osc_ocb_osb:
+                case loop_order_t::icc_occ_osc_ocb_osb:
                     nd_iterator_init(0, ocb, ocb_work, osb, osb_work);
                     break;
             }
 
             while (loop_start < loop_end) {
-                const int n = (osb + osb_s) * jbgp.os_block;
-                const int cur_icc = icc + icc_start;
+                const bool ocb_inner_most
+                        = order == loop_order_t::osc_occ_icc_osb_ocb;
+
                 const bool copy_buffer_a = jbgp.use_buffer_a
                         && IMPLICATION(ocb_inner_most, ocb == 0);
-                ker(ithr_oc_mb, nthr_oc_mb, ithr_ic, n, ocb + ocb_s, cur_icc,
-                        cur_icc == icc_start, osb, copy_buffer_a, prev_ker_idx);
+                ker(ithr_oc_mb, nthr_oc_mb, ithr_ic, osb, osb_s, ocb, ocb_s,
+                        icc, icc_start, copy_buffer_a, prev_ker_idx);
 
                 ++loop_start;
                 switch (order) {
-                    case osc_occ_icc_osb_ocb:
+                    case loop_order_t::osc_occ_icc_osb_ocb:
                         nd_iterator_step(
                                 icc, icc_work, osb, osb_work, ocb, ocb_work);
                         break;
-                    case osc_occ_osb_ocb_icc:
+                    case loop_order_t::osc_occ_osb_ocb_icc:
                         nd_iterator_step(
                                 osb, osb_work, ocb, ocb_work, icc, icc_work);
                         break;
-                    case icc_osc_occ_osb_ocb:
+                    case loop_order_t::icc_osc_occ_osb_ocb:
                         nd_iterator_step(osb, osb_work, ocb, ocb_work);
                         break;
-                    case icc_occ_osc_ocb_osb:
+                    case loop_order_t::icc_occ_osc_ocb_osb:
                         nd_iterator_step(ocb, ocb_work, osb, osb_work);
                         break;
                 }
@@ -500,11 +486,11 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
             ++start;
             switch (order) {
-                case osc_occ_icc_osb_ocb:
-                case osc_occ_osb_ocb_icc:
+                case loop_order_t::osc_occ_icc_osb_ocb:
+                case loop_order_t::osc_occ_osb_ocb_icc:
                     nd_iterator_step(osc, os_chunks, occ, oc_chunks);
                     break;
-                case icc_osc_occ_osb_ocb:
+                case loop_order_t::icc_osc_occ_osb_ocb:
                     nd_iterator_step(osc, os_chunks, occ, oc_chunks);
                     if (start == end) {
                         icc++;
@@ -515,7 +501,7 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                         }
                     }
                     break;
-                case icc_occ_osc_ocb_osb:
+                case loop_order_t::icc_occ_osc_ocb_osb:
                     nd_iterator_step(occ, oc_chunks, osc, os_chunks);
                     if (start == end) {
                         icc++;
@@ -532,6 +518,10 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     });
 
     if (jbgp.nthr_ic_b > 1) {
+        const bool is_f32
+                = everyone_is(f32, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt);
+        const bool is_f32_compute = is_f32 && !jbgp.is_bf32;
+        MAYBE_UNUSED(is_f32_compute);
         assert(jbgp.use_buffer && is_f32_compute);
 
         const auto get_dst_reduced_off = [&](int ithr_ic, int osb, int ocb) {
@@ -595,7 +585,7 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                                     = (jbgp.oc - ocb * jbgp.oc_block
                                             < jbgp.oc_block);
                             const int brg_ker_idx = brgemm_inner_product_utils::
-                                    get_brg_kernel_index(jbgp, false, false,
+                                    get_brg_kernel_index(false, false,
                                             is_os_tail, is_oc_tail, false);
                             maybe_tile_configure(is_amx, brg_kernel_palettes_,
                                     brg_ker_idx, prev_ker_idx);
@@ -710,7 +700,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
     bool is_oc_tail = (jbgp.oc < jbgp.oc_block) && !jbgp.use_buffer_a;
     const int base_brg_ker_idx = brgemm_inner_product_utils::
             get_brg_kernel_index( // TODO: Can be calculated on initialization stage
-                    jbgp, false, false, is_os_tail, is_ic_tail, is_oc_tail);
+                    false, false, is_os_tail, is_ic_tail, is_oc_tail);
 
     const int os_chunks = div_up(jbgp.nb_os, jbgp.nb_os_blocking);
     const int work_amount = jbgp.nb_ic * os_chunks;
@@ -734,6 +724,10 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
             case OIw16i64o2i:
             case OIhw16i64o2i:
             case OIdhw16i64o2i: fwd_oc_block = 4 * jbgp.simd_w; break;
+            case OI16i48o:
+            case OIw16i48o:
+            case OIhw16i48o:
+            case OIdhw16i48o: fwd_oc_block = 3 * jbgp.simd_w; break;
             case OI16i32o:
             case OIw16i32o:
             case OIhw16i32o:
@@ -828,13 +822,13 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
 
         auto is_bs_tail = (nb_oc_b != jbgp.nb_oc_blocking);
         const int brg_ker_idx
-                = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                = brgemm_inner_product_utils::get_brg_kernel_index(
                         is_bs_tail, kernel_init, is_os_tail, is_ic_tail, false);
         auto brg_kernel = brg_kernels_[brg_ker_idx].get();
 
         const int size_B = jbgp.LDB * rnd_up(jbgp.K, 2);
 
-        const size_t b_buf_shift = jbgp.ip_bwd_d_global_b_transpose
+        const size_t b_buf_shift = jbgp.global_b_transpose
                 ? icb * jbgp.nb_oc + ocb
                 : ithr * jbgp.gemm_batch_size;
         const size_t b_buf_off = buf_dt_size * b_buf_shift * size_B;
@@ -860,7 +854,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                                         oc + oc_block * jbgp.oc_block);
                 addr_batch[oc_block].ptr.B
                         = b_buffer + buf_dt_size * (oc_block * size_B);
-                if (!jbgp.ip_bwd_d_global_b_transpose && do_b_transpose)
+                if (!jbgp.global_b_transpose && do_b_transpose)
                     transform_b_chunk((char *)addr_batch[oc_block].ptr.B,
                             get_weights_ptr(icb, ocb + oc_block), 1,
                             is_ic_tail ? jbgp.ic % jbgp.ic_block
@@ -886,7 +880,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
             assert(!jbgp.use_buffer_a);
             auto use_init_ker = (kernel_init && nb_oc_b == 0);
             const int brg_kernel_oc_tail_idx
-                    = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                    = brgemm_inner_product_utils::get_brg_kernel_index(
                             false, use_init_ker, is_os_tail, is_ic_tail, true);
             maybe_tile_configure(is_amx, brg_kernel_palettes_,
                     brg_kernel_oc_tail_idx, prev_ker_idx);
@@ -896,7 +890,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                     + get_blk_off(diff_dst_d, jbgp.dst_dt, n,
                             oc + oc_block * jbgp.oc_block);
             addr_batch[0].ptr.B = b_buffer + buf_dt_size * (oc_block * size_B);
-            if (!jbgp.ip_bwd_d_global_b_transpose && do_b_transpose) {
+            if (!jbgp.global_b_transpose && do_b_transpose) {
                 transform_b_chunk((char *)addr_batch[0].ptr.B,
                         get_weights_ptr(icb, ocb + oc_block), 1,
                         is_ic_tail ? jbgp.ic % jbgp.ic_block : jbgp.ic_block,
@@ -920,9 +914,8 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
         }
     };
 
-    if (jbgp.ip_bwd_d_global_b_transpose && jbgp.use_buffer_b) {
-        assert(IMPLICATION(
-                jbgp.ip_bwd_d_global_b_transpose, jbgp.nthr_oc_b == 1));
+    if (jbgp.global_b_transpose && jbgp.use_buffer_b) {
+        assert(IMPLICATION(jbgp.global_b_transpose, jbgp.nthr_oc_b == 1));
         parallel(num_threads, [&](const int ithr, const int nthr) {
             int start {0}, end {0};
             int max_ch_block = nstl::max(jbgp.ic_block, jbgp.oc_block);
@@ -1115,8 +1108,7 @@ struct brgemm_inner_product_bwd_weights_t<isa>::thread_info_t {
                 ? scratchpad.template get<char>(key_brgemm_primitive_buffer_b)
                 : nullptr;
 
-        thread_local_input_buffers_
-                = jbgp.ip_bwd_w_local_buffers_for_input_tensors;
+        thread_local_input_buffers_ = jbgp.local_buffers_for_input_tensors;
         int ic_chunks = utils::div_up(jbgp.nb_ic, jbgp.nb_ic_blocking);
         int os_chunks = utils::div_up(jbgp.nb_os, jbgp.nb_os_blocking);
         nb_ic_blocking_ = jbgp.nb_ic_blocking;
@@ -1462,7 +1454,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
         const bool transform_weights = jbgp.wei_dt != jbgp.acc_dt
                 && (jbgp.nthr_mb == 1 || os_chunks == 1)
                 && osc == (os_chunks - 1);
-        const bool transform_b = jbgp.ip_bwd_w_local_buffers_for_input_tensors
+        const bool transform_b = jbgp.local_buffers_for_input_tensors
                 ? jbgp.use_buffer_b && icb % jbgp.nb_ic_blocking == 0
                         && ocb % jbgp.nb_oc_blocking == 0
                         && IMPLICATION(osc_prev == osc,
@@ -1470,7 +1462,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
                 : jbgp.use_buffer_b
                         && icb == ti->ic_c_start * jbgp.nb_ic_blocking
                         && ocb % jbgp.nb_oc_blocking == 0;
-        const bool transform_a = jbgp.ip_bwd_w_local_buffers_for_input_tensors
+        const bool transform_a = jbgp.local_buffers_for_input_tensors
                 ? jbgp.use_buffer_a && ocb % jbgp.nb_oc_blocking == 0
                         && IMPLICATION(osc_prev == osc,
                                 icc_prev != icb / jbgp.nb_ic_blocking)
@@ -1482,7 +1474,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
 
         auto is_bs_tail = (nb_os_b != jbgp.nb_os_blocking);
         const int brg_ker_idx
-                = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                = brgemm_inner_product_utils::get_brg_kernel_index(
                         is_bs_tail, kernel_init, is_ic_tail, is_oc_tail, false);
         auto brg_kernel = brg_kernels_[brg_ker_idx].get();
 
@@ -1548,7 +1540,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
         if (is_os_tail) {
             auto use_init_ker = (kernel_init && nb_os_b == 0);
             const int brg_ker_idx_os_tail
-                    = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                    = brgemm_inner_product_utils::get_brg_kernel_index(
                             false, use_init_ker, is_ic_tail, is_oc_tail, true);
             auto brg_kernel_os_tail = brg_kernels_[brg_ker_idx_os_tail].get();
             if (brg_kernel_os_tail != nullptr)
@@ -1620,12 +1612,9 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
     const auto loop_end = occ_work * icc_work * osc_work;
 
     int occ_idx = 0, icc_idx = 0, osc_idx = 0;
-    loop_order_t loop_order = jbgp.ip_bwd_w_local_buffers_for_input_tensors
-            ? loop_order_t::osc_icc_occ
-            : jbgp.harness == harness_mb_reduction ? loop_order_t::osc_occ_icc
-                                                   : loop_order_t::occ_icc_osc;
 
-    switch (loop_order) {
+    using loop_order_t = jit_brgemm_ip_bwd_w_conf_t::loop_order_t;
+    switch (jbgp.loop_order) {
         case loop_order_t::osc_icc_occ:
             nd_iterator_init(loop_idx, osc_idx, osc_work, icc_idx, icc_work,
                     occ_idx, occ_work);
@@ -1663,7 +1652,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
 
         ++loop_idx;
 
-        switch (loop_order) {
+        switch (jbgp.loop_order) {
             case loop_order_t::osc_icc_occ:
                 nd_iterator_step(osc_idx, osc_work, icc_idx, icc_work, occ_idx,
                         occ_work);

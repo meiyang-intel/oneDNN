@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2023 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -43,41 +43,95 @@ namespace x64 {
 
 namespace brgemm_inner_product_utils {
 
-status_t init_ip_conf(cpu_isa_t isa, jit_brgemm_primitive_conf_t &jbgp,
-        const inner_product_desc_t &ipd, memory_desc_t &src_md,
-        memory_desc_t &weights_md, memory_desc_t &dst_md,
-        memory_desc_t &bias_md, primitive_attr_t &attr, int nthreads);
+// Common for fwd/bwd_d/bwd_w.
+struct jit_brgemm_ip_conf_t : jit_brgemm_primitive_conf_t {
+    // Use kernels and blocking for small os that consume less bandwidth.
+    bool use_small_os_kernels = false;
 
-void init_scratchpad(memory_tracking::registrar_t &scratchpad,
-        const jit_brgemm_primitive_conf_t &jbgp);
+protected:
+    status_t init_conf_base(cpu_isa_t isa, const inner_product_desc_t &ipd,
+            memory_desc_t &src_md, memory_desc_t &weights_md,
+            memory_desc_t &dst_md, memory_desc_t &bias_md,
+            primitive_attr_t &attr, int nthreads);
+
+    void init_scratchpad_base(memory_tracking::registrar_t &scratchpad) const;
+
+    int get_os_block(bool try_to_adjust, bool is_adjustment) const;
+    int get_oc_block(bool try_to_adjust = false) const;
+    std::unordered_map<int, format_tag_t> get_desired_weights_tag() const;
+
+    int get_adjusted_oc_block() const;
+    int get_nb_oc_blocking(bool is_adjustment = false) const;
+    bool adjust_thread_balance() const;
+
+    format_tag_t get_brgemm_ip_weights_tag(
+            const memory_desc_t &weights_md) const;
+};
+
+// Specific for forward.
+struct jit_brgemm_ip_fwd_conf_t : jit_brgemm_ip_conf_t {
+    enum loop_order_t {
+        osc_occ_icc_osb_ocb,
+        osc_occ_osb_ocb_icc,
+        icc_osc_occ_osb_ocb,
+        icc_occ_osc_ocb_osb,
+    } loop_order
+            = osc_occ_osb_ocb_icc;
+
+    status_t init_conf(cpu_isa_t isa, const inner_product_desc_t &ipd,
+            memory_desc_t &src_md, memory_desc_t &weights_md,
+            memory_desc_t &dst_md, memory_desc_t &bias_md,
+            primitive_attr_t &attr, int nthreads);
+
+    void init_scratchpad(memory_tracking::registrar_t &scratchpad) const;
+
+private:
+    void choose_loop_order();
+};
+
+// Specific for backward by data.
+struct jit_brgemm_ip_bwd_d_conf_t : jit_brgemm_ip_conf_t {
+    bool global_b_transpose;
+
+    status_t init_conf(cpu_isa_t isa, const inner_product_desc_t &ipd,
+            memory_desc_t &src_md, memory_desc_t &weights_md,
+            memory_desc_t &dst_md, memory_desc_t &bias_md,
+            primitive_attr_t &attr, int nthreads);
+
+    void init_scratchpad(memory_tracking::registrar_t &scratchpad) const;
+};
+
+// Specific for backward by weights.
+struct jit_brgemm_ip_bwd_w_conf_t : jit_brgemm_ip_conf_t {
+    enum loop_order_t {
+        osc_icc_occ,
+        osc_occ_icc,
+        occ_icc_osc,
+    } loop_order
+            = occ_icc_osc;
+
+    bool local_buffers_for_input_tensors;
+
+    status_t init_conf(cpu_isa_t isa, const inner_product_desc_t &ipd,
+            memory_desc_t &src_md, memory_desc_t &weights_md,
+            memory_desc_t &dst_md, memory_desc_t &bias_md,
+            primitive_attr_t &attr, int nthreads);
+
+    void init_scratchpad(memory_tracking::registrar_t &scratchpad) const;
+
+private:
+    void thread_balance(int &nb_os_blocking_, int &nb_oc_blocking_,
+            int &nb_ic_blocking_, int &nthr_, int &nthr_mb_, int &nthr_oc_b_,
+            int &nthr_ic_b_) const;
+
+    void choose_loop_order();
+};
 
 static const int max_num_brg_kernels_ip = 2 * 2 * 2 * 2 * 2;
 
-int get_brg_kernel_index(const jit_brgemm_primitive_conf_t &jbgp,
-        bool is_bs_tail, bool do_initialization, bool is_M_tail, bool is_N_tail,
-        bool is_K_tail);
+int get_brg_kernel_index(bool is_bs_tail, bool do_initialization,
+        bool is_M_tail, bool is_N_tail, bool is_K_tail);
 
-int get_os_block(const jit_brgemm_primitive_conf_t &jbgp, bool try_to_adjust,
-        bool is_adjustment);
-int get_oc_block(
-        const jit_brgemm_primitive_conf_t &jbgp, bool try_to_adjust = false);
-
-int ip_fwd_get_oc_block(const jit_brgemm_primitive_conf_t &jbgp);
-int ip_fwd_get_nb_oc_blocking(
-        const jit_brgemm_primitive_conf_t &jbgp, bool is_adjustment = false);
-bool ip_fwd_adjust_thread_balance(const jit_brgemm_primitive_conf_t &jbgp);
-int ip_fwd_get_adjusted_oc_block(const jit_brgemm_primitive_conf_t &jbgp);
-
-format_tag_t get_brgemm_ip_weights_tag(
-        cpu_isa_t isa, const jit_brgemm_primitive_conf_t &jbgp);
-bool post_ops_ok(jit_brgemm_primitive_conf_t &jbgp,
-        const primitive_attr_t &attr, const memory_desc_wrapper &dst_d);
-void thread_balance(const jit_brgemm_primitive_conf_t &j, int &nb_os_blocking_,
-        int &nthr_, int &nthr_mb_, int &nthr_oc_b_, int &nthr_ic_b_);
-status_t init_ip_conf_fwd(jit_brgemm_primitive_conf_t &jbgp,
-        const primitive_attr_t &attr, const memory_desc_wrapper &dst_d);
-status_t init_ip_conf_bwd_d(jit_brgemm_primitive_conf_t &jbgp);
-status_t init_ip_conf_bwd_w(jit_brgemm_primitive_conf_t &jbgp);
 size_t buf_dt_size(data_type_t dt, cpu_isa_t isa);
 
 } // namespace brgemm_inner_product_utils
